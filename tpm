@@ -1,0 +1,853 @@
+#!/usr/bin/env bash
+# TPM - Termux Package Manager
+# Main executable
+# Version: 0.1.0
+
+set -euo pipefail
+
+# ------------------------------------------------------------------------------
+# Configuration & Initialization
+# ------------------------------------------------------------------------------
+
+# Default paths (will be overridden by config)
+PREFIX="${PREFIX:-/data/data/com.termux/files/usr}"
+TPM_LIB_DIR="${PREFIX}/lib/tpm"
+TPM_VERSION="0.1.0"
+
+# Global flags
+TPM_FORCE=false
+TPM_VERBOSE=false
+TPM_DEBUG=false
+
+# Parse global flags from command line
+parse_global_flags() {
+    local args=("$@")
+    local filtered_args=()
+    
+    for arg in "${args[@]}"; do
+        case "$arg" in
+            --force)
+                TPM_FORCE=true
+                ;;
+            --verbose)
+                TPM_VERBOSE=true
+                ;;
+            --debug)
+                TPM_DEBUG=true
+                ;;
+            *)
+                filtered_args+=("$arg")
+                ;;
+        esac
+    done
+    
+    echo "${filtered_args[@]}"
+}
+
+# Setup logging based on flags
+setup_logging() {
+    if [[ "$TPM_DEBUG" == "true" ]]; then
+        export TPM_DEBUG=1
+        set -x
+    fi
+    
+    if [[ "$TPM_VERBOSE" == "true" ]]; then
+        export TPM_VERBOSE=1
+    fi
+}
+
+# Source all libraries
+source_libraries() {
+    local libs=("core.sh" "manifest.sh" "transaction.sh" "github.sh" "store.sh")
+    
+    for lib in "${libs[@]}"; do
+        if [[ -f "${TPM_LIB_DIR}/${lib}" ]]; then
+            source "${TPM_LIB_DIR}/${lib}"
+        else
+            echo "[ERROR] Missing library: ${TPM_LIB_DIR}/${lib}" >&2
+            echo "[ERROR] TPM may not be installed correctly. Try reinstalling." >&2
+            exit 1
+        fi
+    done
+}
+
+# Initialize TPM
+initialize_tpm() {
+    # Source libraries first
+    source_libraries
+    
+    # Setup logging based on flags
+    setup_logging
+    
+    # Initialize core module
+    if ! init_core; then
+        log_error "Failed to initialize TPM core"
+        exit 1
+    fi
+    
+    log_debug "TPM initialized successfully"
+}
+
+# ------------------------------------------------------------------------------
+# Command Implementations
+# ------------------------------------------------------------------------------
+
+# Install command
+cmd_install() {
+    local tool_id="$1"
+    
+    # Parse owner/repo from tool_id
+    if [[ ! "$tool_id" =~ ^[a-zA-Z0-9_.-]+/[a-zA-Z0-9_.-]+$ ]]; then
+        log_error "Invalid tool ID format: $tool_id"
+        log_error "Expected format: owner/repo (e.g., sharkdp/bat)"
+        return 1
+    fi
+    
+    local owner="${tool_id%/*}"
+    local repo="${tool_id#*/}"
+    
+    log_info "Installing: $owner/$repo"
+    
+    # Check if already installed (unless force)
+    if [[ "$TPM_FORCE" != "true" ]] && tool_installed "$tool_id"; then
+        local current_version
+        current_version=$(get_tool_version "$tool_id")
+        log_error "Tool already installed: $tool_id (v$current_version)"
+        log_error "Use --force to reinstall or update to update"
+        return 1
+    fi
+    
+    # Validate repository exists
+    if ! validate_repository "$owner" "$repo"; then
+        return 1
+    fi
+    
+    # Get latest release
+    local release_json
+    if ! release_json=$(get_latest_release "$owner" "$repo"); then
+        return 1
+    fi
+    
+    local version
+    version=$(json_field "$release_json" "tag_name")
+    
+    if [[ -z "$version" ]]; then
+        log_error "Failed to get version from release"
+        return 1
+    fi
+    
+    log_info "Latest version: $version"
+    
+    # Check if this version is already installed
+    if [[ "$TPM_FORCE" != "true" ]] && tool_installed "$tool_id"; then
+        local installed_version
+        installed_version=$(get_tool_version "$tool_id")
+        
+        if version_eq "$version" "$installed_version"; then
+            log_info "Latest version already installed: v$version"
+            return 0
+        fi
+        
+        if version_gt "$installed_version" "$version"; then
+            log_warn "Installed version (v$installed_version) is newer than latest (v$version)"
+            log_warn "Use --force to downgrade"
+            return 1
+        fi
+    fi
+    
+    # Select best asset
+    local asset_info
+    if ! asset_info=$(select_best_asset "$release_json"); then
+        return 1
+    fi
+    
+    # Parse asset info (name url size)
+    read -r asset_name asset_url asset_size <<< "$asset_info"
+    
+    log_info "Selected asset: $asset_name ($(human_size "$asset_size"))"
+    
+    # Get checksum if available
+    local checksum
+    checksum=$(get_asset_checksum "$release_json" "$asset_name")
+    
+    # Begin transaction
+    if ! tpm_begin "install" "$tool_id"; then
+        return 1
+    fi
+    
+    # Download asset
+    local download_dir
+    download_dir=$(mktemp -d "${TPM_TMP_DIR}/download.XXXXXX")
+    local asset_path="${download_dir}/${asset_name}"
+    
+    if ! download_asset "$asset_url" "$asset_path" "$checksum"; then
+        tpm_rollback
+        rm -rf "$download_dir"
+        return 1
+    fi
+    
+    # Install to store
+    local install_result
+    if ! install_result=$(install_to_store "$owner" "$repo" "$version" "$asset_path"); then
+        tpm_rollback
+        rm -rf "$download_dir"
+        return 1
+    fi
+    
+    # Parse result (store_binary_path binary_name)
+    read -r store_binary_path binary_name <<< "$install_result"
+    
+    # Create symlink
+    if ! create_symlink "$store_binary_path" "$binary_name"; then
+        tpm_rollback
+        rm -rf "$download_dir"
+        return 1
+    fi
+    
+    # Add to manifest
+    local -A tool_data=(
+        ["tool"]="$tool_id"
+        ["version"]="$version"
+        ["binary"]="$binary_name"
+        ["store_path"]="$store_binary_path"
+        ["symlink_path"]="${TPM_BIN_DIR}/${binary_name}"
+        ["checksum"]="$checksum"
+    )
+    
+    if tool_installed "$tool_id"; then
+        # Update existing entry
+        if ! update_tool "$tool_id" tool_data; then
+            tpm_rollback
+            rm -rf "$download_dir"
+            return 1
+        fi
+    else
+        # Add new entry
+        if ! add_tool tool_data; then
+            tpm_rollback
+            rm -rf "$download_dir"
+            return 1
+        fi
+    fi
+    
+    # Set current version symlink
+    if ! set_current_version "$owner" "$repo" "$version"; then
+        log_warn "Failed to set current version symlink (non-fatal)"
+    fi
+    
+    # Commit transaction (this should save manifest)
+    if ! tpm_commit; then
+        log_error "Failed to commit transaction"
+        tpm_rollback
+        rm -rf "$download_dir"
+        return 1
+    fi
+    
+    # Cleanup
+    rm -rf "$download_dir"
+    
+    # Force manifest save to ensure consistency
+    save_manifest 2>/dev/null || true
+    
+    log_success "Installed $tool_id v$version"
+    return 0
+}
+
+# List command
+cmd_list() {
+    log_info "Installed tools:"
+    echo ""
+    
+    local tools
+    tools=$(get_all_tools)
+    
+    if [[ -z "$tools" ]]; then
+        echo "  No tools installed"
+        echo ""
+        echo "Get started: tpm install sharkdp/bat"
+        return 0
+    fi
+    
+    # Print table header
+    printf "  ${BOLD}%-30s %-15s %-12s${NC}\n" "Tool" "Version" "Binary"
+    printf "  %-30s %-15s %-12s\n" "----" "-------" "------"
+    
+    # Print each tool
+    while IFS= read -r tool_id; do
+        local -A tool_info
+        if get_tool_info "$tool_id" tool_info; then
+            local version="${tool_info[version]:-unknown}"
+            local binary="${tool_info[binary]:-unknown}"
+            
+            printf "  %-30s %-15s %-12s\n" "$tool_id" "$version" "$binary"
+            
+            if [[ "$TPM_VERBOSE" == "true" ]]; then
+                printf "      Store: %s\n" "${tool_info[store_path]:-}"
+                printf "      Symlink: %s\n" "${tool_info[symlink_path]:-}"
+                printf "      Installed: %s\n" "${tool_info[installed_at]:-}"
+                echo ""
+            fi
+        fi
+    done <<< "$tools"
+    
+    echo ""
+    return 0
+}
+
+# Update command
+cmd_update() {
+    local tool_id="${1:-}"
+    local update_all="${2:-false}"
+    
+    if [[ -z "$tool_id" ]] && [[ "$update_all" != "true" ]]; then
+        log_error "No tool specified. Use: tpm update <tool> or tpm update --all"
+        return 1
+    fi
+    
+    if [[ "$update_all" == "true" ]]; then
+        log_info "Updating all installed tools..."
+        
+        local tools
+        tools=$(get_all_tools)
+        local updated=0
+        local failed=0
+        local failed_tools=()
+        
+        while IFS= read -r tool; do
+            echo ""
+            log_info "Updating: $tool"
+            
+            if cmd_update "$tool"; then
+                ((updated++))
+            else
+                ((failed++))
+                failed_tools+=("$tool")
+            fi
+        done <<< "$tools"
+        
+        echo ""
+        
+        if [[ $failed -eq 0 ]]; then
+            log_success "All tools updated successfully ($updated total)"
+        else
+            log_warn "Update summary: $updated updated, $failed failed"
+            log_warn "Failed tools: ${failed_tools[*]}"
+            log_warn "Run 'tpm update <tool>' individually to retry failed updates"
+            return 1
+        fi
+        
+        return 0
+    fi
+    
+    # Update single tool
+    log_info "Checking for updates: $tool_id"
+    
+    # Parse owner/repo
+    local owner="${tool_id%/*}"
+    local repo="${tool_id#*/}"
+    
+    # Check if installed
+    if ! tool_installed "$tool_id"; then
+        log_error "Tool not installed: $tool_id"
+        log_error "Use: tpm install $tool_id"
+        return 1
+    fi
+    
+    # Get current version
+    local current_version
+    current_version=$(get_tool_version "$tool_id")
+    
+    # Get latest version
+    local latest_version
+    if ! latest_version=$(get_latest_version "$owner" "$repo"); then
+        return 1
+    fi
+    
+    if version_eq "$current_version" "$latest_version"; then
+        log_info "$tool_id is already up to date (v$current_version)"
+        return 0
+    fi
+    
+    if version_gt "$current_version" "$latest_version"; then
+        log_warn "Current version (v$current_version) is newer than latest (v$latest_version)"
+        log_warn "This can happen with pre-releases or version tagging issues"
+        return 0
+    fi
+    
+    log_info "Updating $tool_id from v$current_version to v$latest_version"
+    
+    # Temporarily set force flag for update
+    local old_force="$TPM_FORCE"
+    TPM_FORCE=true
+    
+    # Perform update by reinstalling
+    if cmd_install "$tool_id"; then
+        TPM_FORCE="$old_force"
+        log_success "Updated $tool_id to v$latest_version"
+        
+        # Clean up old versions (keep 3)
+        if cleanup_old_versions "$owner" "$repo" "3"; then
+            log_debug "Cleaned up old versions"
+        fi
+        
+        return 0
+    else
+        TPM_FORCE="$old_force"
+        log_error "Failed to update $tool_id"
+        return 1
+    fi
+}
+
+# Remove command
+cmd_remove() {
+    local tool_id="$1"
+    
+    log_info "Removing: $tool_id"
+    
+    # Check if installed
+    if ! tool_installed "$tool_id"; then
+        log_error "Tool not installed: $tool_id"
+        return 1
+    fi
+    
+    # Get tool info
+    local -A tool_info
+    if ! get_tool_info "$tool_id" tool_info; then
+        log_error "Failed to get tool information"
+        return 1
+    fi
+    
+    local version="${tool_info[version]}"
+    local store_path="${tool_info[store_path]}"
+    local symlink_path="${tool_info[symlink_path]}"
+    local binary="${tool_info[binary]}"
+    
+    # Confirm removal (unless force)
+    if [[ "$TPM_FORCE" != "true" ]]; then
+        echo ""
+        echo "  Tool:      $tool_id"
+        echo "  Version:   $version"
+        echo "  Binary:    $binary"
+        echo "  Store:     $(dirname "$store_path")"
+        echo "  Symlink:   $symlink_path"
+        echo ""
+        
+        read -p "Are you sure you want to remove this tool? [y/N] " -n 1 -r
+        echo ""
+        if [[ ! $REPLY =~ ^[Yy]$ ]]; then
+            log_info "Removal cancelled"
+            return 0
+        fi
+    fi
+    
+    # Begin transaction
+    if ! tpm_begin "remove" "$tool_id"; then
+        return 1
+    fi
+    
+    # Remove symlink
+    if [[ -L "$symlink_path" ]]; then
+        log_debug "Removing symlink: $symlink_path"
+        record_remove "$symlink_path"
+        rm -f "$symlink_path"
+    fi
+    
+    # Remove from store
+    if [[ -e "$store_path" ]]; then
+        local store_dir
+        store_dir=$(dirname "$(dirname "$store_path")")  # Go up from bin/ to version dir
+        
+        log_debug "Removing store directory: $store_dir"
+        record_remove "$store_dir"
+        rm -rf "$store_dir"
+    fi
+    
+    # Remove from manifest
+    if ! remove_tool "$tool_id"; then
+        log_error "Failed to remove tool from manifest"
+        tpm_rollback
+        return 1
+    fi
+    
+    # Commit transaction (saves manifest)
+    if ! tpm_commit; then
+        log_error "Failed to commit removal"
+        tpm_rollback
+        return 1
+    fi
+    
+    # Force manifest save
+    save_manifest 2>/dev/null || true
+    
+    # Clean up parent directories if empty
+    local owner="${tool_id%/*}"
+    local repo="${tool_id#*/}"
+    local repo_dir="${TPM_STORE_DIR}/${owner}/${repo}"
+    local owner_dir="${TPM_STORE_DIR}/${owner}"
+    
+    if [[ -d "$repo_dir" ]] && [[ -z "$(ls -A "$repo_dir" 2>/dev/null)" ]]; then
+        rmdir "$repo_dir" 2>/dev/null || true
+    fi
+    
+    if [[ -d "$owner_dir" ]] && [[ -z "$(ls -A "$owner_dir" 2>/dev/null)" ]]; then
+        rmdir "$owner_dir" 2>/dev/null || true
+    fi
+    
+    log_success "Removed $tool_id v$version"
+    return 0
+}
+
+# Info command
+cmd_info() {
+    local tool_id="$1"
+    
+    # Check if installed
+    if ! tool_installed "$tool_id"; then
+        log_warn "Tool not installed: $tool_id"
+        
+        # Try to get info from GitHub
+        local owner="${tool_id%/*}"
+        local repo="${tool_id#*/}"
+        
+        if validate_repository "$owner" "$repo" 2>/dev/null; then
+            log_info "Repository exists: $tool_id"
+            
+            local latest_version
+            if latest_version=$(get_latest_version "$owner" "$repo" 2>/dev/null); then
+                echo ""
+                echo "  Tool:      $tool_id"
+                echo "  Status:    Not installed"
+                echo "  Latest:    v$latest_version"
+                echo ""
+                echo "  Install with: tpm install $tool_id"
+                return 0
+            fi
+        fi
+        
+        log_error "Tool not found locally or on GitHub"
+        return 1
+    fi
+    
+    # Get local info
+    local -A tool_info
+    get_tool_info "$tool_id" tool_info
+    
+    local version="${tool_info[version]}"
+    local binary="${tool_info[binary]}"
+    local store_path="${tool_info[store_path]}"
+    local symlink_path="${tool_info[symlink_path]}"
+    local installed_at="${tool_info[installed_at]}"
+    local checksum="${tool_info[checksum]:-none}"
+    
+    # Get latest version from GitHub
+    local owner="${tool_id%/*}"
+    local repo="${tool_id#*/}"
+    local latest_version=""
+    local update_available=false
+    
+    if latest_version=$(get_latest_version "$owner" "$repo" 2>/dev/null); then
+        if version_gt "$latest_version" "$version"; then
+            update_available=true
+        fi
+    fi
+    
+    # Display information
+    echo ""
+    echo "  Tool:      $tool_id"
+    echo "  Version:   v$version"
+    
+    if [[ -n "$latest_version" ]]; then
+        echo "  Latest:    v$latest_version"
+        
+        if [[ "$update_available" == "true" ]]; then
+            echo "  Update:    ${GREEN}Available${NC}"
+        else
+            echo "  Update:    Up to date"
+        fi
+    else
+        echo "  Latest:    Unknown (GitHub unreachable)"
+    fi
+    
+    echo "  Binary:    $binary"
+    echo "  Store:     $(dirname "$store_path")"
+    echo "  Symlink:   $symlink_path"
+    
+    # Check if symlink is valid and points to store path
+    if [[ -L "$symlink_path" ]]; then
+        local link_target
+        link_target=$(readlink -f "$symlink_path" 2>/dev/null || true)
+        local store_target
+        store_target=$(readlink -f "$store_path" 2>/dev/null || true)
+        
+        if [[ "$link_target" == "$store_target" ]]; then
+            echo "  Status:    ${GREEN}Symlink OK${NC}"
+        else
+            echo "  Status:    ${YELLOW}Symlink points elsewhere${NC}"
+            echo "             Actual target: $link_target"
+        fi
+    else
+        echo "  Status:    ${RED}Symlink missing${NC}"
+    fi
+    
+    echo "  Checksum:  $checksum"
+    echo "  Installed: $installed_at"
+    
+    # Show file size if store path exists
+    if [[ -f "$store_path" ]]; then
+        local size
+        size=$(stat -c %s "$store_path" 2>/dev/null || stat -f %z "$store_path" 2>/dev/null || echo "unknown")
+        echo "  Size:      $(human_size "$size")"
+    fi
+    
+    echo ""
+    
+    if [[ "$update_available" == "true" ]]; then
+        echo "  Update with: tpm update $tool_id"
+    fi
+    
+    return 0
+}
+
+# Repair command
+cmd_repair() {
+    log_info "Repairing TPM installation..."
+    
+    # Validate manifest
+    if ! validate_manifest; then
+        log_warn "Manifest validation failed"
+    fi
+    
+    # Validate store
+    if ! validate_store; then
+        log_warn "Store validation failed"
+    fi
+    
+    # Repair symlinks
+    if repair_symlinks; then
+        log_success "Symlinks repaired"
+    else
+        log_warn "Some symlinks could not be repaired"
+    fi
+    
+    # Clean up temporary files
+    if [[ -d "$TPM_TMP_DIR" ]]; then
+        find "$TPM_TMP_DIR" -type f -mtime +1 -delete 2>/dev/null || true
+        log_debug "Cleaned up old temporary files"
+    fi
+    
+    # Force manifest save
+    save_manifest 2>/dev/null || true
+    
+    log_success "Repair completed"
+    return 0
+}
+
+# Cleanup command
+cmd_cleanup() {
+    log_info "Cleaning up old versions..."
+    
+    local tools
+    tools=$(get_all_tools)
+    local cleaned=0
+    local errors=0
+    
+    while IFS= read -r tool_id; do
+        local owner="${tool_id%/*}"
+        local repo="${tool_id#*/}"
+        
+        if cleanup_old_versions "$owner" "$repo" "3"; then
+            ((cleaned++))
+        else
+            ((errors++))
+        fi
+    done <<< "$tools"
+    
+    if [[ $errors -eq 0 ]]; then
+        log_success "Cleanup completed ($cleaned tools processed)"
+    else
+        log_warn "Cleanup completed with $errors error(s)"
+    fi
+    
+    return 0
+}
+
+# Version command
+cmd_version() {
+    echo "TPM - Termux Package Manager"
+    echo "Version: $TPM_VERSION"
+    echo ""
+    echo "Store:    $TPM_STORE_DIR"
+    echo "Arch:     $TPM_ARCH"
+    echo "Bash:     $(bash --version | head -n1 | awk '{print $4}')"
+    echo "Curl:     $(curl --version | head -n1 | awk '{print $2}')"
+    
+    if [[ "$TPM_VERBOSE" == "true" ]]; then
+        echo ""
+        echo "Configuration:"
+        echo "  TPM_BIN_DIR: $TPM_BIN_DIR"
+        echo "  TPM_LIB_DIR: $TPM_LIB_DIR"
+        echo "  TPM_STORE_DIR: $TPM_STORE_DIR"
+        echo "  TPM_TMP_DIR: $TPM_TMP_DIR"
+        echo "  TPM_MANIFEST_FILE: $TPM_MANIFEST_FILE"
+    fi
+    
+    return 0
+}
+
+# Help command
+cmd_help() {
+    cat <<EOF
+TPM - Termux Package Manager
+Version: $TPM_VERSION
+
+Usage: tpm <command> [options]
+
+Commands:
+  install <owner/repo>    Install a tool from GitHub
+  list                    List installed tools
+  update <tool>           Update a specific tool
+  update --all            Update all installed tools
+  remove <tool>           Remove an installed tool
+  info <tool>             Show information about a tool
+  repair                  Repair TPM installation
+  cleanup                 Clean up old versions
+  version                 Show TPM version
+  help                    Show this help message
+
+Options (global, can appear anywhere):
+  --force                 Force operation (install/remove)
+  --verbose               Show verbose output
+  --debug                 Show debug information
+
+Examples:
+  tpm install sharkdp/bat
+  tpm list
+  tpm update sharkdp/bat
+  tpm remove sharkdp/bat
+  tpm info sharkdp/bat
+
+Configuration:
+  Edit: ~/.tpm/config
+  Uninstall: ~/.tpm/uninstall.sh
+
+GitHub Rate Limits:
+  TPM uses GitHub's API which has rate limits.
+  If you hit limits, wait an hour or use a GitHub token.
+
+EOF
+    return 0
+}
+
+# ------------------------------------------------------------------------------
+# Main Argument Parser
+# ------------------------------------------------------------------------------
+
+main() {
+    # Parse global flags first
+    local filtered_args
+    filtered_args=$(parse_global_flags "$@")
+    
+    # Set filtered args as positional parameters
+    eval set -- "$filtered_args"
+    
+    # Initialize TPM (loads config, sets up modules)
+    initialize_tpm
+    
+    # Parse command
+    local command="${1:-}"
+    shift 2>/dev/null || true
+    
+    case "$command" in
+        install|add)
+            local tool_id="${1:-}"
+            
+            if [[ -z "$tool_id" ]]; then
+                log_error "No tool specified"
+                log_error "Usage: tpm install <owner/repo>"
+                exit 1
+            fi
+            
+            cmd_install "$tool_id"
+            ;;
+        
+        list|ls)
+            cmd_list
+            ;;
+        
+        update|upgrade)
+            local tool_id="${1:-}"
+            local update_all=false
+            
+            if [[ "${1:-}" == "--all" ]]; then
+                update_all=true
+                tool_id=""
+            fi
+            
+            cmd_update "$tool_id" "$update_all"
+            ;;
+        
+        remove|uninstall|rm)
+            local tool_id="${1:-}"
+            
+            if [[ -z "$tool_id" ]]; then
+                log_error "No tool specified"
+                log_error "Usage: tpm remove <tool>"
+                exit 1
+            fi
+            
+            cmd_remove "$tool_id"
+            ;;
+        
+        info|show)
+            local tool_id="${1:-}"
+            
+            if [[ -z "$tool_id" ]]; then
+                log_error "No tool specified"
+                log_error "Usage: tpm info <tool>"
+                exit 1
+            fi
+            
+            cmd_info "$tool_id"
+            ;;
+        
+        repair|fix)
+            cmd_repair
+            ;;
+        
+        cleanup|clean)
+            cmd_cleanup
+            ;;
+        
+        version|-v|--version)
+            cmd_version
+            ;;
+        
+        help|-h|--help|"")
+            cmd_help
+            ;;
+        
+        *)
+            log_error "Unknown command: $command"
+            echo ""
+            cmd_help
+            exit 1
+            ;;
+    esac
+    
+    # Final manifest save (redundant but safe)
+    save_manifest 2>/dev/null || true
+}
+
+# ------------------------------------------------------------------------------
+# Entry Point
+# ------------------------------------------------------------------------------
+
+# Check if we're being sourced or executed
+if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+    # Set up error handling
+    set -o errtrace
+    trap 'log_error "Script error at line $LINENO"; exit 1' ERR
+    
+    # Run main function
+    main "$@"
+fi
