@@ -627,7 +627,7 @@ init_github() {
     mkdir -p "$GITHUB_RELEASE_CACHE_DIR"
     
     # Set default User-Agent for GitHub API
-    export GITHUB_USER_AGENT="TPM/$TPM_VERSION (https://github.com/termux-pm/tpm)"
+    export GITHUB_USER_AGENT="TPM/$TPM_VERSION (https://github.com/x49dev/tpm)"
     
     log_debug "GitHub module initialized"
     return 0

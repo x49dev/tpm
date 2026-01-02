@@ -16,7 +16,7 @@ A lightweight, dependency-free package manager for Termux that enables safe, ver
 ### Installation
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/termux-pm/tpm/main/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/x49dev/tpm/refs/heads/main/install.sh | bash
 ```
 
 Basic Usage

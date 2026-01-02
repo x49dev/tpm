@@ -18,7 +18,7 @@ fi
 
 # Configuration
 TPM_VERSION="0.1.0"
-TPM_REPO="https://raw.githubusercontent.com/termux-pm/tpm"
+TPM_REPO="https://raw.githubusercontent.com/x49dev/tpm"
 TPM_BRANCH="main"
 
 # Default paths (Termux specific)
