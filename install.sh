@@ -397,6 +397,7 @@ main() {
 }
 
 # Only run main if script is executed, not sourced
-if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+# Handle cases where BASH_SOURCE might not be available
+if [[ "${BASH_SOURCE[0]:-}" == "${0}" ]]; then
     main "$@"
 fi
